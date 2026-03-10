@@ -122,6 +122,25 @@ def patch_default_layout(layout_kdl: Path, rows: int) -> bool:
     return False
 
 
+def grant_permission(wasm_path: Path) -> bool:
+    """Pre-grant ReadApplicationState in ~/.cache/zellij/permissions.kdl. Returns True if added."""
+    cache_dir = Path.home() / ".cache" / "zellij"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    perms_file = cache_dir / "permissions.kdl"
+
+    entry_key = f'"{wasm_path}"'
+    block = f'{entry_key} {{\n    ReadApplicationState\n}}\n'
+
+    if perms_file.exists():
+        text = perms_file.read_text()
+        if entry_key in text:
+            return False  # already granted
+        perms_file.write_text(text.rstrip() + "\n\n" + block)
+    else:
+        perms_file.write_text(block)
+    return True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Install configurable tab-bar plugin")
     ap.add_argument("--wasm-src", required=True, help="Path to compiled tab-bar.wasm")
@@ -141,7 +160,8 @@ def main() -> None:
 
     install_wasm(wasm_src, config_dir, args.max_backups)
 
-    wasm_install_path = f"~/.config/zellij/plugins/tab-bar.wasm"
+    wasm_install_path = "~/.config/zellij/plugins/tab-bar.wasm"
+    wasm_abs_path = (config_dir / "plugins" / "tab-bar.wasm").resolve()
     config_kdl = config_dir / "config.kdl"
     if config_kdl.exists():
         changed = patch_config_kdl(config_kdl, wasm_install_path, args.rows)
@@ -152,6 +172,10 @@ def main() -> None:
     changed = patch_default_layout(layout_kdl, args.rows)
     status = "[green]✓ patched[/green]" if changed else "[dim]already correct[/dim]"
     console.print(f"  {status} layouts/default.kdl pane size={args.rows}")
+
+    changed = grant_permission(wasm_abs_path)
+    status = "[green]✓ granted[/green]" if changed else "[dim]already granted[/dim]"
+    console.print(f"  {status} ReadApplicationState permission in ~/.cache/zellij/permissions.kdl")
 
     console.print("\n[bold green]Installation complete.[/bold green]")
     console.print("Restart Zellij (or open a new session) to see the two-row tab bar.")
