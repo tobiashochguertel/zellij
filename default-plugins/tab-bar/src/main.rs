@@ -192,10 +192,9 @@ impl ZellijPlugin for State {
             }
 
             let row_str = if row_idx == name_row {
-                // Tab names row: the full upstream tab_line (session name + names + arrows).
-                self.tab_line
-                    .iter()
-                    .fold(String::new(), |out, p| out + &p.part)
+                // Tab names row: tab parts rendered as-is, but the session-name prefix is
+                // blanked so it only appears on row 0.
+                build_name_row(&self.tab_line, &self.mode_info)
             } else {
                 // Body row: arrows at tab boundaries, blank content inside each tab.
                 // show_prefix=true only for row 0 so the session name stays top-left.
@@ -221,6 +220,31 @@ impl ZellijPlugin for State {
 
         print!("{}", output);
     }
+}
+
+/// Builds the tab-names row: tab `LinePart`s are rendered as-is (with names + arrows), but
+/// the session-name prefix (the leading `tab_index = None` parts) is replaced with blank
+/// background so the session name appears only on row 0.
+fn build_name_row(tab_line: &[LinePart], mode_info: &ModeInfo) -> String {
+    let fill_bg = mode_info.style.colors.text_unselected.background;
+    let mut output = String::new();
+    let mut seen_tab = false;
+    for part in tab_line {
+        if part.tab_index.is_some() {
+            seen_tab = true;
+        }
+        if part.tab_index.is_none() && !seen_tab {
+            // Session name prefix: blank it on this row.
+            output.push_str(&format!(
+                "{}{}\x1b[0m",
+                ansi_color_bg(fill_bg),
+                " ".repeat(part.len)
+            ));
+        } else {
+            output.push_str(&part.part);
+        }
+    }
+    output
 }
 
 /// Builds a body row: powerline arrows at every tab boundary, blank content inside each tab.
