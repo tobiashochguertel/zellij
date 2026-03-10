@@ -32,6 +32,8 @@ struct State {
     mode_info: ModeInfo,
     tab_line: Vec<LinePart>,
     hide_swap_layout_indication: bool,
+    /// Number of rows to render (1 = original single-row, 2+ = tab index row above tab names row).
+    configured_rows: usize,
 }
 
 static ARROW_SEPARATOR: &str = "";
@@ -44,6 +46,11 @@ impl ZellijPlugin for State {
             .get("hide_swap_layout_indication")
             .map(|s| s == "true")
             .unwrap_or(false);
+        self.configured_rows = configuration
+            .get("rows")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
         set_selectable(false);
         subscribe(&[
             EventType::TabUpdate,
@@ -97,7 +104,7 @@ impl ZellijPlugin for State {
         should_render
     }
 
-    fn render(&mut self, _rows: usize, cols: usize) {
+    fn render(&mut self, rows: usize, cols: usize) {
         if self.tabs.is_empty() {
             return;
         }
@@ -141,18 +148,97 @@ impl ZellijPlugin for State {
             &background,
         );
 
-        let output = self
-            .tab_line
-            .iter()
-            .fold(String::new(), |output, part| output + &part.part);
-
-        match background {
-            PaletteColor::Rgb((r, g, b)) => {
-                print!("{}\u{1b}[48;2;{};{};{}m\u{1b}[0K", output, r, g, b);
-            },
-            PaletteColor::EightBit(color) => {
-                print!("{}\u{1b}[48;5;{}m\u{1b}[0K", output, color);
-            },
+        // Use two-row mode when the config requests it AND the pane is tall enough.
+        let effective_rows = self.configured_rows.min(rows);
+        if effective_rows >= 2 {
+            let row0 = build_number_row(&self.tab_line, &self.tabs, &self.mode_info);
+            let row1 = self
+                .tab_line
+                .iter()
+                .fold(String::new(), |output, part| output + &part.part);
+            match background {
+                PaletteColor::Rgb((r, g, b)) => {
+                    print!(
+                        "{}\u{1b}[48;2;{};{};{}m\u{1b}[0K\r\n{}\u{1b}[48;2;{};{};{}m\u{1b}[0K",
+                        row0, r, g, b, row1, r, g, b
+                    );
+                },
+                PaletteColor::EightBit(color) => {
+                    print!(
+                        "{}\u{1b}[48;5;{}m\u{1b}[0K\r\n{}\u{1b}[48;5;{}m\u{1b}[0K",
+                        row0, color, row1, color
+                    );
+                },
+            }
+        } else {
+            let output = self
+                .tab_line
+                .iter()
+                .fold(String::new(), |output, part| output + &part.part);
+            match background {
+                PaletteColor::Rgb((r, g, b)) => {
+                    print!("{}\u{1b}[48;2;{};{};{}m\u{1b}[0K", output, r, g, b);
+                },
+                PaletteColor::EightBit(color) => {
+                    print!("{}\u{1b}[48;5;{}m\u{1b}[0K", output, color);
+                },
+            }
         }
+    }
+}
+
+/// Builds a row of tab index numbers aligned with the widths of the corresponding tab segments
+/// from `tab_line`. Non-tab segments (session name, fill) are rendered as blank space using the
+/// background fill colour.
+fn build_number_row(tab_line: &[LinePart], tabs: &[TabInfo], mode_info: &ModeInfo) -> String {
+    let palette = mode_info.style.colors;
+    let fill_bg = palette.text_unselected.background;
+    let mut output = String::new();
+    for part in tab_line {
+        if let Some(tab_idx) = part.tab_index {
+            let is_active = tabs.get(tab_idx).map(|t| t.active).unwrap_or(false);
+            let (bg, fg) = if is_active {
+                (palette.ribbon_selected.background, palette.ribbon_selected.base)
+            } else {
+                (palette.ribbon_unselected.background, palette.ribbon_unselected.base)
+            };
+            let num_str = center_in_width(tab_idx + 1, part.len);
+            output.push_str(&format!(
+                "{}{}{}\x1b[0m",
+                ansi_color_bg(bg),
+                ansi_color_fg(fg),
+                num_str
+            ));
+        } else {
+            let spaces = " ".repeat(part.len);
+            output.push_str(&format!("{}{}\x1b[0m", ansi_color_bg(fill_bg), spaces));
+        }
+    }
+    output
+}
+
+fn center_in_width(num: usize, width: usize) -> String {
+    let s = format!(" {} ", num);
+    let slen = s.len(); // ASCII only
+    if slen >= width {
+        return s.chars().take(width).collect();
+    }
+    let pad = width - slen;
+    let left_pad = pad / 2;
+    let right_pad = pad - left_pad;
+    format!("{}{}{}", " ".repeat(left_pad), s, " ".repeat(right_pad))
+}
+
+fn ansi_color_bg(c: PaletteColor) -> String {
+    match c {
+        PaletteColor::Rgb((r, g, b)) => format!("\x1b[48;2;{};{};{}m", r, g, b),
+        PaletteColor::EightBit(n) => format!("\x1b[48;5;{}m", n),
+    }
+}
+
+fn ansi_color_fg(c: PaletteColor) -> String {
+    match c {
+        PaletteColor::Rgb((r, g, b)) => format!("\x1b[38;2;{};{};{}m", r, g, b),
+        PaletteColor::EightBit(n) => format!("\x1b[38;5;{}m", n),
     }
 }
