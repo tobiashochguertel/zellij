@@ -51,6 +51,7 @@ impl ZellijPlugin for State {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1)
             .max(1);
+        request_permission(&[PermissionType::ReadApplicationState]);
         set_selectable(false);
         subscribe(&[
             EventType::TabUpdate,
