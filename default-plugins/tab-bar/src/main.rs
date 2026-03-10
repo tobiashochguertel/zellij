@@ -8,7 +8,7 @@ use std::convert::TryInto;
 use tab::get_tab_to_focus;
 use zellij_tile::prelude::*;
 
-use crate::line::tab_line;
+use crate::line::{tab_line, tab_separator};
 use crate::tab::tab_style;
 
 #[derive(Debug, Default)]
@@ -51,7 +51,10 @@ impl ZellijPlugin for State {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1)
             .max(1);
-        request_permission(&[PermissionType::ReadApplicationState]);
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+        ]);
         set_selectable(false);
         subscribe(&[
             EventType::TabUpdate,
@@ -150,13 +153,15 @@ impl ZellijPlugin for State {
         );
 
         // Use two-row mode when the config requests it AND the pane is tall enough.
+        // Row 0 (top) = original full tab line: session name + styled tabs (upstream unchanged).
+        // Row 1 (bottom) = number hints: tab index numbers with matching arrow separators.
         let effective_rows = self.configured_rows.min(rows);
         if effective_rows >= 2 {
-            let row0 = build_number_row(&self.tab_line, &self.tabs, &self.mode_info);
-            let row1 = self
+            let row0 = self
                 .tab_line
                 .iter()
                 .fold(String::new(), |output, part| output + &part.part);
+            let row1 = build_number_row(&self.tab_line, &self.tabs, &self.mode_info);
             match background {
                 PaletteColor::Rgb((r, g, b)) => {
                     print!(
@@ -188,29 +193,61 @@ impl ZellijPlugin for State {
     }
 }
 
-/// Builds a row of tab index numbers aligned with the widths of the corresponding tab segments
-/// from `tab_line`. Non-tab segments (session name, fill) are rendered as blank space using the
-/// background fill colour.
+/// Builds a number-hints row aligned to the tab segments in `tab_line`.
+///
+/// For each tab segment: renders `left_arrow + centered_number + right_arrow` using the same
+/// powerline arrow characters and background colours as the corresponding tab in row 0.
+/// For non-tab segments (session name prefix, fill): renders blank background.
 fn build_number_row(tab_line: &[LinePart], tabs: &[TabInfo], mode_info: &ModeInfo) -> String {
     let palette = mode_info.style.colors;
     let fill_bg = palette.text_unselected.background;
+    let sep = tab_separator(mode_info.capabilities);
+    // Arrow separator is either 1 Unicode char () or empty string.
+    let sep_width: usize = if sep.is_empty() { 0 } else { 1 };
+
     let mut output = String::new();
     for part in tab_line {
         if let Some(tab_idx) = part.tab_index {
-            let is_active = tabs.get(tab_idx).map(|t| t.active).unwrap_or(false);
-            let (bg, fg) = if is_active {
-                (palette.ribbon_selected.background, palette.ribbon_selected.base)
+            // Determine tab colors the same way render_tab() does in tab.rs:
+            // even positions = non-alternate, odd positions = alternate.
+            let (bg, fg) = if let Some(tab) = tabs.iter().find(|t| t.position == tab_idx) {
+                if tab.active {
+                    (palette.ribbon_selected.background, palette.ribbon_selected.base)
+                } else if tab_idx % 2 == 1 {
+                    (palette.ribbon_unselected.emphasis_1, palette.ribbon_unselected.base)
+                } else {
+                    (palette.ribbon_unselected.background, palette.ribbon_unselected.base)
+                }
             } else {
-                (palette.ribbon_unselected.background, palette.ribbon_unselected.base)
+                (fill_bg, palette.text_unselected.base)
             };
-            let num_str = center_in_width(tab_idx + 1, part.len);
+
+            let inner_width = part.len.saturating_sub(sep_width * 2);
+            let num_str = center_in_width(tab_idx + 1, inner_width);
+
+            // Left arrow: bg=tab, fg=fill  (mirrors tab.rs: style!(fill_color, bg).paint(sep))
+            output.push_str(&format!(
+                "{}{}{}\x1b[0m",
+                ansi_color_bg(bg),
+                ansi_color_fg(fill_bg),
+                sep
+            ));
+            // Number: bg=tab, fg=tab_text
             output.push_str(&format!(
                 "{}{}{}\x1b[0m",
                 ansi_color_bg(bg),
                 ansi_color_fg(fg),
                 num_str
             ));
+            // Right arrow: bg=fill, fg=tab  (mirrors tab.rs: style!(bg, fill_color).paint(sep))
+            output.push_str(&format!(
+                "{}{}{}\x1b[0m",
+                ansi_color_bg(fill_bg),
+                ansi_color_fg(bg),
+                sep
+            ));
         } else {
+            // Session name prefix, fill, or other non-tab segments → blank background
             let spaces = " ".repeat(part.len);
             output.push_str(&format!("{}{}\x1b[0m", ansi_color_bg(fill_bg), spaces));
         }
