@@ -1,0 +1,127 @@
+version: "3"
+
+vars:
+  TAB_BAR_DIR: "{{.ROOT_DIR}}/default-plugins/tab-bar"
+  WASM_RELEASE_PATH: "{{.ROOT_DIR}}/target/wasm32-wasip1/release/tab-bar.wasm"
+  ZELLIJ_CONFIG_DIR:
+    sh: echo "$HOME/.config/zellij"
+  MAX_BACKUPS: '{{.MAX_BACKUPS | default "10"}}'
+  DEBUG: '{{.DEBUG | default "false"}}'
+  CONTAINER_RUNTIME:
+    sh: |
+      if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        echo "docker"
+      elif command -v podman >/dev/null 2>&1; then
+        echo "podman"
+      else
+        echo ""
+      fi
+  COMPOSE_CMD:
+    sh: |
+      if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        if docker compose version >/dev/null 2>&1; then
+          echo "docker compose"
+        elif command -v docker-compose >/dev/null 2>&1; then
+          echo "docker-compose"
+        fi
+      elif command -v podman-compose >/dev/null 2>&1; then
+        echo "podman-compose"
+      fi
+
+tasks:
+
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  # ── deps ───────────────────────────────────────────────────────────────────
+  deps:install:
+    desc: Install wasm32-wasip1 Rust target
+    cmds:
+      - rustup target add wasm32-wasip1
+
+  # ── build ──────────────────────────────────────────────────────────────────
+  build:
+    desc: Build the configurable tab-bar WASM plugin (release)
+    dir: "{{.TAB_BAR_DIR}}"
+    sources:
+      - src/**/*.rs
+      - Cargo.toml
+    generates:
+      - "{{.WASM_RELEASE_PATH}}"
+    cmds:
+      - cargo build --target wasm32-wasip1 --release
+
+  build:dev:
+    desc: Build the WASM plugin (debug, faster iteration)
+    dir: "{{.TAB_BAR_DIR}}"
+    cmds:
+      - cargo build --target wasm32-wasip1
+
+  # ── install ────────────────────────────────────────────────────────────────
+  install:
+    desc: Build and install plugin into ~/.config/zellij (with timestamped backup, max {{.MAX_BACKUPS}} kept)
+    summary: |
+      1. Builds the WASM plugin.
+      2. Backs up any existing ~/.config/zellij/plugins/tab-bar.wasm with timestamp.
+      3. Copies the new WASM into place.
+      4. Patches config.kdl to override the tab-bar alias to our custom build.
+      5. Patches layouts/default.kdl to use pane size=2 for the tab-bar.
+      6. Prunes backups older than MAX_BACKUPS (default 10).
+    cmds:
+      - task: build
+      - uv run --script "{{.ROOT_DIR}}/scripts/install-plugin.py"
+          --wasm-src "{{.WASM_RELEASE_PATH}}"
+          --config-dir "{{.ZELLIJ_CONFIG_DIR}}"
+          --rows 2
+          --max-backups "{{.MAX_BACKUPS}}"
+
+  # ── test ───────────────────────────────────────────────────────────────────
+  test:matrix:
+    desc: Build against multiple zellij-tile versions to verify compatibility
+    summary: |
+      Compiles the WASM plugin against a matrix of zellij-tile crate versions
+      (0.41.2, 0.42.2, 0.43.1, host version, latest on crates.io).
+      Each version runs in an isolated temp directory.
+      Cargo registry is cached under .cache/cargo/ to avoid re-downloads.
+    cmds:
+      - uv run --script "{{.ROOT_DIR}}/scripts/test-matrix.py"
+
+  test:matrix:clear-cache:
+    desc: Clear the local Cargo registry cache used by test:matrix
+    cmds:
+      - rm -rf "{{.ROOT_DIR}}/.cache/cargo"
+      - echo "Cache cleared."
+
+  # ── act ────────────────────────────────────────────────────────────────────
+  act:run:
+    desc: "Run GitHub Actions workflow locally via act (auto-detects Docker/Podman)"
+    summary: |
+      Runs .github/workflows/compat-matrix.yml locally using the act tool.
+      Pass extra arguments after --:
+        task act:run -- --list
+        task act:run -- --dry-run
+    preconditions:
+      - sh: "command -v act"
+        msg: "act is not installed. Install via: mise use -g act  or  dnf/apt install act"
+    cmds:
+      - |
+        if [ -n "{{.CONTAINER_RUNTIME}}" ]; then
+          if [ "{{.CONTAINER_RUNTIME}}" = "podman" ]; then
+            SOCK=$(podman info --format '{{`{{.Host.RemoteSocket.Path}}`}}' 2>/dev/null || echo "/run/podman/podman.sock")
+            act --container-daemon-socket "unix://$SOCK" {{.CLI_ARGS}}
+          else
+            act {{.CLI_ARGS}}
+          fi
+        else
+          echo "No container runtime detected."
+          exit 1
+        fi
+
+  # ── clean ──────────────────────────────────────────────────────────────────
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - cargo clean --manifest-path "{{.TAB_BAR_DIR}}/Cargo.toml" 2>/dev/null || true
+      - echo "Build artifacts removed."
