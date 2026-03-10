@@ -129,7 +129,7 @@ def grant_permission(wasm_path: Path) -> bool:
     perms_file = cache_dir / "permissions.kdl"
 
     entry_key = f'"{wasm_path}"'
-    block = f'{entry_key} {{\n    ReadApplicationState\n}}\n'
+    block = f'{entry_key} {{\n    ReadApplicationState\n    ChangeApplicationState\n}}\n'
 
     if perms_file.exists():
         text = perms_file.read_text()
