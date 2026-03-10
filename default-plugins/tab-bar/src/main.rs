@@ -8,7 +8,7 @@ use std::convert::TryInto;
 use tab::get_tab_to_focus;
 use zellij_tile::prelude::*;
 
-use crate::line::{tab_line, tab_separator};
+use crate::line::tab_line;
 use crate::tab::tab_style;
 
 #[derive(Debug, Default)]
@@ -152,35 +152,14 @@ impl ZellijPlugin for State {
             &background,
         );
 
-        // Use two-row mode when the config requests it AND the pane is tall enough.
-        // Row 0 (top) = original full tab line: session name + styled tabs (upstream unchanged).
-        // Row 1 (bottom) = number hints: tab index numbers with matching arrow separators.
         let effective_rows = self.configured_rows.min(rows);
-        if effective_rows >= 2 {
-            let row0 = self
-                .tab_line
-                .iter()
-                .fold(String::new(), |output, part| output + &part.part);
-            let row1 = build_number_row(&self.tab_line, &self.tabs, &self.mode_info);
-            match background {
-                PaletteColor::Rgb((r, g, b)) => {
-                    print!(
-                        "{}\u{1b}[48;2;{};{};{}m\u{1b}[0K\r\n{}\u{1b}[48;2;{};{};{}m\u{1b}[0K",
-                        row0, r, g, b, row1, r, g, b
-                    );
-                },
-                PaletteColor::EightBit(color) => {
-                    print!(
-                        "{}\u{1b}[48;5;{}m\u{1b}[0K\r\n{}\u{1b}[48;5;{}m\u{1b}[0K",
-                        row0, color, row1, color
-                    );
-                },
-            }
-        } else {
+
+        if effective_rows <= 1 {
+            // Original single-row behaviour (unchanged).
             let output = self
                 .tab_line
                 .iter()
-                .fold(String::new(), |output, part| output + &part.part);
+                .fold(String::new(), |out, p| out + &p.part);
             match background {
                 PaletteColor::Rgb((r, g, b)) => {
                     print!("{}\u{1b}[48;2;{};{};{}m\u{1b}[0K", output, r, g, b);
@@ -189,82 +168,145 @@ impl ZellijPlugin for State {
                     print!("{}\u{1b}[48;5;{}m\u{1b}[0K", output, color);
                 },
             }
+            return;
         }
+
+        // Multi-row "tall tab" mode.
+        //
+        // Every row renders the same powerline arrows at the same column positions, with the same
+        // tab colours.  This creates a unified tall-tab visual: each tab is a tall rectangle whose
+        // borders span all rows.
+        //
+        // Row layout:
+        //   row 0           → session name prefix (left side) + blank tab bodies (arrows only)
+        //   row (rows/2)    → tab names centred inside the tab body (the "name row")
+        //   all other rows  → blank prefix + blank tab bodies (arrows only)
+        //
+        // Mouse clicks work on any row because get_tab_to_focus uses column only.
+        let name_row = effective_rows / 2;
+        let mut output = String::new();
+
+        for row_idx in 0..effective_rows {
+            if row_idx > 0 {
+                output.push_str("\r\n");
+            }
+
+            let row_str = if row_idx == name_row {
+                // Tab names row: the full upstream tab_line (session name + names + arrows).
+                self.tab_line
+                    .iter()
+                    .fold(String::new(), |out, p| out + &p.part)
+            } else {
+                // Body row: arrows at tab boundaries, blank content inside each tab.
+                // show_prefix=true only for row 0 so the session name stays top-left.
+                build_body_row(
+                    &self.tab_line,
+                    &self.tabs,
+                    &self.mode_info,
+                    row_idx == 0,
+                )
+            };
+
+            output.push_str(&row_str);
+            // Clear to end of line with the background colour.
+            match background {
+                PaletteColor::Rgb((r, g, b)) => {
+                    output.push_str(&format!("\u{1b}[48;2;{};{};{}m\u{1b}[0K", r, g, b));
+                },
+                PaletteColor::EightBit(color) => {
+                    output.push_str(&format!("\u{1b}[48;5;{}m\u{1b}[0K", color));
+                },
+            }
+        }
+
+        print!("{}", output);
     }
 }
 
-/// Builds a number-hints row aligned to the tab segments in `tab_line`.
+/// Builds a body row: powerline arrows at every tab boundary, blank content inside each tab.
 ///
-/// For each tab segment: renders `left_arrow + centered_number + right_arrow` using the same
-/// powerline arrow characters and background colours as the corresponding tab in row 0.
-/// For non-tab segments (session name prefix, fill): renders blank background.
-fn build_number_row(tab_line: &[LinePart], tabs: &[TabInfo], mode_info: &ModeInfo) -> String {
+/// `show_prefix=true` (row 0 only): session-name/leading `LinePart`s before the first tab are
+/// rendered as-is so the session name remains visible on the top row.
+/// `show_prefix=false`: those parts become blank background — used for all other body rows.
+///
+/// The arrow colours match those produced by `tab.rs`, so all rows share identical arrow
+/// styling and together form a unified tall-tab visual.
+fn build_body_row(
+    tab_line: &[LinePart],
+    tabs: &[TabInfo],
+    mode_info: &ModeInfo,
+    show_prefix: bool,
+) -> String {
+    use crate::line::tab_separator;
+
     let palette = mode_info.style.colors;
     let fill_bg = palette.text_unselected.background;
     let sep = tab_separator(mode_info.capabilities);
-    // Arrow separator is either 1 Unicode char () or empty string.
     let sep_width: usize = if sep.is_empty() { 0 } else { 1 };
 
     let mut output = String::new();
+    let mut seen_tab = false;
+
     for part in tab_line {
-        if let Some(tab_idx) = part.tab_index {
-            // Determine tab colors the same way render_tab() does in tab.rs:
-            // even positions = non-alternate, odd positions = alternate.
-            let (bg, fg) = if let Some(tab) = tabs.iter().find(|t| t.position == tab_idx) {
-                if tab.active {
-                    (palette.ribbon_selected.background, palette.ribbon_selected.base)
-                } else if tab_idx % 2 == 1 {
-                    (palette.ribbon_unselected.emphasis_1, palette.ribbon_unselected.base)
+        match part.tab_index {
+            None => {
+                if !seen_tab && show_prefix {
+                    // Session name / leading decoration before first tab: keep as-is.
+                    output.push_str(&part.part);
                 } else {
-                    (palette.ribbon_unselected.background, palette.ribbon_unselected.base)
+                    // Trailing fill or suppressed prefix: plain background fill.
+                    output.push_str(&format!(
+                        "{}{}\x1b[0m",
+                        ansi_color_bg(fill_bg),
+                        " ".repeat(part.len)
+                    ));
                 }
-            } else {
-                (fill_bg, palette.text_unselected.base)
-            };
+            },
+            Some(tab_idx) => {
+                seen_tab = true;
+                let (tab_bg, _fg) = tab_colors(tab_idx, tabs, palette);
+                let inner_width = part.len.saturating_sub(sep_width * 2);
 
-            let inner_width = part.len.saturating_sub(sep_width * 2);
-            let num_str = center_in_width(tab_idx + 1, inner_width);
-
-            // Left arrow: bg=tab, fg=fill  (mirrors tab.rs: style!(fill_color, bg).paint(sep))
-            output.push_str(&format!(
-                "{}{}{}\x1b[0m",
-                ansi_color_bg(bg),
-                ansi_color_fg(fill_bg),
-                sep
-            ));
-            // Number: bg=tab, fg=tab_text
-            output.push_str(&format!(
-                "{}{}{}\x1b[0m",
-                ansi_color_bg(bg),
-                ansi_color_fg(fg),
-                num_str
-            ));
-            // Right arrow: bg=fill, fg=tab  (mirrors tab.rs: style!(bg, fill_color).paint(sep))
-            output.push_str(&format!(
-                "{}{}{}\x1b[0m",
-                ansi_color_bg(fill_bg),
-                ansi_color_fg(bg),
-                sep
-            ));
-        } else {
-            // Session name prefix, fill, or other non-tab segments → blank background
-            let spaces = " ".repeat(part.len);
-            output.push_str(&format!("{}{}\x1b[0m", ansi_color_bg(fill_bg), spaces));
+                // Left arrow  – fg=fill, bg=tab  → fill→tab colour transition
+                output.push_str(&format!(
+                    "{}{}{}\x1b[0m",
+                    ansi_color_bg(tab_bg),
+                    ansi_color_fg(fill_bg),
+                    sep
+                ));
+                // Blank body  – bg=tab
+                output.push_str(&format!(
+                    "{}{}\x1b[0m",
+                    ansi_color_bg(tab_bg),
+                    " ".repeat(inner_width)
+                ));
+                // Right arrow – fg=tab, bg=fill  → tab→fill colour transition
+                output.push_str(&format!(
+                    "{}{}{}\x1b[0m",
+                    ansi_color_bg(fill_bg),
+                    ansi_color_fg(tab_bg),
+                    sep
+                ));
+            },
         }
     }
     output
 }
 
-fn center_in_width(num: usize, width: usize) -> String {
-    let s = format!(" {} ", num);
-    let slen = s.len(); // ASCII only
-    if slen >= width {
-        return s.chars().take(width).collect();
+/// Returns the (background, foreground) colours for a tab at `tab_idx`.
+fn tab_colors(tab_idx: usize, tabs: &[TabInfo], palette: Styling) -> (PaletteColor, PaletteColor) {
+    let fill_bg = palette.text_unselected.background;
+    if let Some(tab) = tabs.iter().find(|t| t.position == tab_idx) {
+        if tab.active {
+            (palette.ribbon_selected.background, palette.ribbon_selected.base)
+        } else if tab_idx % 2 == 1 {
+            (palette.ribbon_unselected.emphasis_1, palette.ribbon_unselected.base)
+        } else {
+            (palette.ribbon_unselected.background, palette.ribbon_unselected.base)
+        }
+    } else {
+        (fill_bg, palette.text_unselected.base)
     }
-    let pad = width - slen;
-    let left_pad = pad / 2;
-    let right_pad = pad - left_pad;
-    format!("{}{}{}", " ".repeat(left_pad), s, " ".repeat(right_pad))
 }
 
 fn ansi_color_bg(c: PaletteColor) -> String {
